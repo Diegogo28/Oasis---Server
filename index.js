@@ -1,14 +1,14 @@
 // Servidor de Oasis. Node 18 o superior, sin dependencias externas.
 //
 // Variables de entorno
-//   STEAM_API_KEY  (obligatoria)  clave de la API de Steam
-//   PUBLIC_URL     (obligatoria en linea)  direccion publica, ej. https://oasis-server.onrender.com
-//   XBL_APP_KEY    (para Xbox)    clave publica de tu "Xbox App" en OpenXBL
-//   XBL_AUTH_URL   (opcional)     por defecto https://xbl.io/app/auth
-//   XBL_CLAIM_URL  (opcional)     por defecto https://xbl.io/app/claim
-//   XBL_API_BASE   (opcional)     por defecto prueba https://api.xbl.io/v2 y luego https://xbl.io/api/v2
-//   APP_SCHEME     (opcional)     esquema de la app, por defecto "oasis"
-//   STEAM_API_BASE (opcional)     solo para pruebas
+//   STEAM_API_KEY    (obligatoria)  clave de la API de Steam
+//   PUBLIC_URL       (obligatoria en linea)  direccion publica, ej. https://oasis-server.onrender.com
+//   XBL_PUBLIC_KEY   (para Xbox)    clave PUBLICA de tu app en OpenXBL (la que va en /app/auth/{publicKey})
+//   XBL_APP_KEY      (para Xbox)    clave de la app que se envia al canjear el codigo (/app/claim);
+//                                   si no existe se usa XBL_PUBLIC_KEY
+//   XBL_BASE         (opcional)     por defecto https://api.xbl.io
+//   APP_SCHEME       (opcional)     esquema de la app, por defecto "oasis"
+//   STEAM_API_BASE   (opcional)     solo para pruebas
 const http = require('http');
 const crypto = require('crypto');
 
@@ -16,10 +16,9 @@ const PORT = process.env.PORT || 3000;
 const KEY = process.env.STEAM_API_KEY;
 const BASE = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const STEAM = process.env.STEAM_API_BASE || 'https://api.steampowered.com';
-const XBL_APP = process.env.XBL_APP_KEY;
-const XBL_AUTH = process.env.XBL_AUTH_URL || 'https://xbl.io/app/auth';
-const XBL_CLAIM = process.env.XBL_CLAIM_URL || 'https://xbl.io/app/claim';
-const XBL_BASES = process.env.XBL_API_BASE ? [process.env.XBL_API_BASE] : ['https://api.xbl.io/v2', 'https://xbl.io/api/v2'];
+const XBL = (process.env.XBL_BASE || 'https://api.xbl.io').replace(/\/$/, '');
+const XBL_PUBLIC = process.env.XBL_PUBLIC_KEY || process.env.XBL_APP_KEY;
+const XBL_SECRET = process.env.XBL_APP_KEY || process.env.XBL_PUBLIC_KEY;
 const SCHEME = process.env.APP_SCHEME || 'oasis';
 
 if (!KEY) { console.error('Falta STEAM_API_KEY'); process.exit(1); }
@@ -87,37 +86,44 @@ async function steam(id) {
 }
 
 // ---------- Xbox (OpenXBL, servicio de terceros) ----------
+// Respuestas segun la especificacion OpenAPI de OpenXBL: { content: {...}, code }.
 async function xblGet(path, key) {
-  let last;
-  for (const base of XBL_BASES) {
-    try {
-      return unwrap(await getJson(base + path, { 'X-Authorization': key, 'X-Contract': '100', Accept: 'application/json' }));
-    } catch (e) {
-      last = e;
-      if (e.status === 401 || e.status === 403) break;   // clave invalida: no tiene caso probar otra direccion
-    }
-  }
-  throw last;
+  return unwrap(await getJson(`${XBL}/v2${path}`, { 'X-Authorization': key, Accept: 'application/json' }));
 }
 
-// OJO: la forma exacta de las respuestas de OpenXBL no se pudo verificar; el mapeo es defensivo.
-// Las horas jugadas de Xbox no se obtienen (se muestran como "—" en la app).
+// OpenXBL no entrega minutos jugados: las horas de Xbox quedan como null ("—" en la app).
 async function xbox(key) {
-  const hit = getCached('x' + key.slice(0, 12));
+  const ck = 'x' + key.slice(0, 12);
+  const hit = getCached(ck);
   if (hit) return hit;
-  const [a, acc] = await Promise.all([xblGet('/achievements', key), xblGet('/account', key).catch(() => null)]);
-  const games = ((a && a.titles) || []).map((t) => ({
-    id: 'x' + t.titleId, name: t.name, platform: 'xbox', hours: null,
-    achEarned: (t.achievement || {}).currentAchievements || 0, achTotal: (t.achievement || {}).totalAchievements || 0,
-    cover: t.displayImage,
-  }));
+  const [t, acc, pres] = await Promise.all([
+    xblGet('/titles', key),
+    xblGet('/account', key).catch(() => null),
+    xblGet('/presence', key).catch(() => null),
+  ]);
+  const games = ((t && t.titles) || []).filter((x) => !x.type || /game/i.test(x.type)).map((x) => {
+    const a = x.achievement || {};
+    const cur = a.currentAchievements || 0;
+    let tot = a.totalAchievements || 0;
+    // Xbox a veces informa total 0: se estima con el porcentaje de progreso.
+    if (tot < cur) tot = a.progressPercentage > 0 ? Math.round((cur * 100) / a.progressPercentage) : cur;
+    return { id: 'x' + x.titleId, name: x.name, platform: 'xbox', hours: null, achEarned: cur, achTotal: tot, cover: x.displayImage };
+  });
   let avatar = null;
   try {
-    const s = acc.profileUsers[0].settings.find((x) => x.id === 'GameDisplayPicRaw');
-    avatar = s && s.value;
+    const s2 = acc.profileUsers[0].settings.find((v) => v.id === 'GameDisplayPicRaw');
+    avatar = s2 && s2.value;
   } catch (e) { /* sin foto */ }
-  const out = { games, avatar };
-  setCached('x' + key.slice(0, 12), out);
+  let now = null;
+  try {
+    for (const d of pres.devices || []) {
+      for (const ti of d.titles || []) {
+        if (!now && ti.state === 'Active' && ti.placement === 'Full' && ti.name && ti.name !== 'Home') now = { name: ti.name, platform: 'xbox' };
+      }
+    }
+  } catch (e) { /* sin presencia */ }
+  const out = { games, avatar, now };
+  setCached(ck, out);
   return out;
 }
 
@@ -158,16 +164,16 @@ http.createServer(async (req, res) => {
 
     // Xbox: inicio de sesion mediante OpenXBL.
     if (u.pathname === '/auth/xbox') {
-      if (!XBL_APP) return send(res, 503, { error: 'Falta XBL_APP_KEY' });
-      res.writeHead(302, { Location: `${XBL_AUTH}/${XBL_APP}` });
+      if (!XBL_PUBLIC) return send(res, 503, { error: 'Falta XBL_PUBLIC_KEY' });
+      res.writeHead(302, { Location: `${XBL}/app/auth/${XBL_PUBLIC}` });
       return res.end();
     }
     if (u.pathname === '/auth/xbox/return') {
       const code = u.searchParams.get('code');
-      if (!XBL_APP || !code) { res.statusCode = 400; return res.end('Solicitud no valida'); }
-      const r = await fetch(XBL_CLAIM, {
+      if (!XBL_SECRET || !code) { res.statusCode = 400; return res.end('Solicitud no valida'); }
+      const r = await fetch(`${XBL}/app/claim`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ code, app_key: XBL_APP }),
+        body: JSON.stringify({ code, app_key: XBL_SECRET }),
       });
       if (!r.ok) { res.statusCode = 401; return res.end('No se pudo validar el inicio de sesion de Xbox'); }
       const j = unwrap(await r.json());
