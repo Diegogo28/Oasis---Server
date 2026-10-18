@@ -29,7 +29,8 @@ const tickets = new Map();    // boletos de un solo uso para entregar la clave d
 const hits = new Map();       // limite sencillo de solicitudes por IP
 
 const getCached = (k) => { const c = cache.get(k); return c && c.exp > Date.now() ? c.val : null; };
-const setCached = (k, val) => { cache.set(k, { val, exp: Date.now() + 60000 }); if (cache.size > 500) cache.clear(); };
+const setCached = (k, val, ttl = 60000) => { cache.set(k, { val, exp: Date.now() + ttl }); if (cache.size > 500) cache.clear(); };
+const stale = new Map();    // ultimo valor bueno de cada consulta, por si una consulta posterior falla
 
 function limited(ip) {
   const now = Date.now();
@@ -91,17 +92,35 @@ async function xblGet(path, key) {
   return unwrap(await getJson(`${XBL}/v2${path}`, { 'X-Authorization': key, Accept: 'application/json' }));
 }
 
-// OpenXBL no entrega minutos jugados: las horas de Xbox quedan como null ("—" en la app).
-async function xbox(key) {
-  const ck = 'x' + key.slice(0, 12);
+// Consulta con memoria: ahorra solicitudes (el plan gratuito permite unas 150 por hora)
+// y, si una consulta falla, devuelve el ultimo valor bueno en lugar de perder el dato.
+async function xblCached(path, key, ttl) {
+  const ck = path + '|' + key.slice(0, 12);
   const hit = getCached(ck);
   if (hit) return hit;
+  try {
+    const v = await xblGet(path, key);
+    setCached(ck, v, ttl);
+    if (stale.size > 500) stale.clear();
+    stale.set(ck, v);
+    return v;
+  } catch (e) {
+    if (stale.has(ck)) return stale.get(ck);
+    throw e;
+  }
+}
+
+// OpenXBL no entrega minutos jugados: las horas de Xbox quedan como null ("—" en la app).
+async function xbox(key) {
   const [t, acc, pres] = await Promise.all([
-    xblGet('/titles', key),
-    xblGet('/account', key).catch(() => null),
-    xblGet('/presence', key).catch(() => null),
+    xblCached('/titles', key, 5 * 60000),
+    xblCached('/account', key, 6 * 3600000).catch(() => null),
+    xblCached('/presence', key, 60000).catch(() => null),
   ]);
-  const games = ((t && t.titles) || []).filter((x) => !x.type || /game/i.test(x.type)).map((x) => {
+  const all = (t && t.titles) || [];
+  let list = all.filter((x) => !x.type || /game/i.test(x.type));
+  if (!list.length) list = all;   // si el tipo viene distinto, no se descarta nada
+  let games = list.map((x) => {
     const a = x.achievement || {};
     const cur = a.currentAchievements || 0;
     let tot = a.totalAchievements || 0;
@@ -109,6 +128,17 @@ async function xbox(key) {
     if (tot < cur) tot = a.progressPercentage > 0 ? Math.round((cur * 100) / a.progressPercentage) : cur;
     return { id: 'x' + x.titleId, name: x.name, platform: 'xbox', hours: null, achEarned: cur, achTotal: tot, cover: x.displayImage };
   });
+  // Respaldo: si el historial de titulos llega vacio, se arma la lista con los logros.
+  if (!games.length) {
+    try {
+      const ach = await xblCached('/achievements', key, 5 * 60000);
+      games = ((ach && ach.titles) || []).map((x) => {
+        const l = x.achievements || [];
+        const cur = l.filter((v) => v.isUnlocked).length;
+        return { id: 'x' + x.titleId, name: x.name, platform: 'xbox', hours: null, achEarned: cur, achTotal: Math.max(l.length, cur), cover: x.displayImage };
+      });
+    } catch (e) { /* sin respaldo */ }
+  }
   let avatar = null;
   try {
     const s2 = acc.profileUsers[0].settings.find((v) => v.id === 'GameDisplayPicRaw');
@@ -122,9 +152,23 @@ async function xbox(key) {
       }
     }
   } catch (e) { /* sin presencia */ }
-  const out = { games, avatar, now };
-  setCached(ck, out);
-  return out;
+  return { games, avatar, now };
+}
+
+// Diagnostico: informa que responde OpenXBL, sin devolver datos personales.
+async function xboxDebug(key) {
+  const probe = async (path) => {
+    try { return { ok: true, c: await xblGet(path, key) }; } catch (e) { return { ok: false, status: e.status || null, msg: e.message }; }
+  };
+  const [t, a, acc, pres] = await Promise.all([probe('/titles'), probe('/achievements'), probe('/account'), probe('/presence')]);
+  const titles = (t.ok && t.c && t.c.titles) || [];
+  return {
+    base: XBL,
+    titles: t.ok ? { ok: true, cantidad: titles.length, tipos: [...new Set(titles.map((x) => x.type))], ejemplo: titles.slice(0, 3).map((x) => x.name) } : t,
+    achievements: a.ok ? { ok: true, cantidad: ((a.c && a.c.titles) || []).length } : a,
+    account: { ok: acc.ok, status: acc.status || null },
+    presence: { ok: pres.ok, status: pres.status || null },
+  };
 }
 
 // ---------- servidor ----------
@@ -196,6 +240,11 @@ http.createServer(async (req, res) => {
     // Datos.
     m = /^\/api\/steam\/(\d{17})$/.exec(u.pathname);
     if (m) return send(res, 200, await steam(m[1]));
+    if (u.pathname === '/api/xbox/debug') {
+      const k = req.headers['x-xbl-key'];
+      if (!k || !/^[\w-]{10,200}$/.test(k)) return send(res, 401, { error: 'falta la clave de Xbox' });
+      return send(res, 200, await xboxDebug(k));
+    }
     if (u.pathname === '/api/xbox') {
       const key = req.headers['x-xbl-key'];
       if (!key || !/^[\w-]{10,200}$/.test(key)) return send(res, 401, { error: 'falta la clave de Xbox' });
