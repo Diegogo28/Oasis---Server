@@ -53,7 +53,12 @@ const withParam = (url, k, v) => `${url}${url.includes('?') ? '&' : '?'}${k}=${e
 
 async function getJson(url, headers) {
   const r = await fetch(url, { headers });
-  if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+  if (!r.ok) {
+    const e = new Error('HTTP ' + r.status);
+    e.status = r.status;
+    try { e.detail = (await r.text()).slice(0, 200); } catch (x) { /* sin cuerpo */ }
+    throw e;
+  }
   return r.json();
 }
 
@@ -82,7 +87,7 @@ async function steam(id) {
     achEarned: (ach[g.appid] || [0, 0])[0], achTotal: (ach[g.appid] || [0, 0])[1],
     cover: `https://cdn.cloudflare.steamstatic.com/steam/apps/${g.appid}/header.jpg`,
   }));
-  const out = { games, now: pl.gameextrainfo ? { name: pl.gameextrainfo, platform: 'steam' } : null, avatar: pl.avatarfull };
+  const out = { games, now: pl.gameextrainfo ? { id: pl.gameid ? 's' + pl.gameid : undefined, name: pl.gameextrainfo, platform: 'steam' } : null, avatar: pl.avatarfull };
   setCached('s' + id, out);
   return out;
 }
@@ -103,16 +108,78 @@ async function steamGame(id, lang) {
         developers: d.developers || [],
         release: (d.release_date && !d.release_date.coming_soon && d.release_date.date) || null,
         metacritic: (d.metacritic && d.metacritic.score) || null,
+        screenshots: (d.screenshots || []).slice(0, 4).map((x) => x.path_thumbnail).filter(Boolean),
       }
-    : { description: null, genres: [], developers: [], release: null, metacritic: null };
+    : { description: null, genres: [], developers: [], release: null, metacritic: null, screenshots: [] };
   setCached(ck, out, 24 * 3600000);
+  return out;
+}
+
+// Lista de logros de un juego (nombre, descripcion, icono y si se obtuvo), en el idioma pedido.
+// Sirve solo con perfiles publicos. Se guarda 5 minutos.
+async function steamAch(id, appid, lang) {
+  const ck = `a${id}${appid}${lang}`;
+  const hit = getCached(ck);
+  if (hit) return hit;
+  const [sch, pl] = await Promise.all([
+    getJson(`${STEAM}/ISteamUserStats/GetSchemaForGame/v2/?key=${KEY}&appid=${appid}&l=${lang}`).catch(() => null),
+    getJson(`${STEAM}/ISteamUserStats/GetPlayerAchievements/v1/?key=${KEY}&steamid=${id}&appid=${appid}&l=${lang}`),
+  ]);
+  const defs = (sch && sch.game && sch.game.availableGameStats && sch.game.availableGameStats.achievements) || [];
+  const mine = (pl.playerstats && pl.playerstats.achievements) || [];
+  const byName = {};
+  defs.forEach((d) => { byName[d.name] = d; });
+  const list = mine.map((a) => {
+    const d = byName[a.apiname] || {};
+    const desc = a.description || d.description || '';
+    return {
+      id: a.apiname, name: a.name || d.displayName || a.apiname, description: desc,
+      icon: d.icon || null, iconGray: d.icongray || null, hidden: !!d.hidden && !desc,
+      achieved: !!a.achieved, time: a.unlocktime || 0,
+    };
+  });
+  // Primero los obtenidos (los mas recientes arriba) y despues los pendientes.
+  list.sort((a, b) => (b.achieved - a.achieved) || (b.time - a.time));
+  const out = { list };
+  setCached(ck, out, 5 * 60000);
+  return out;
+}
+
+// Logros obtenidos mas recientemente entre los juegos con logros (hasta 8). Se guarda 5 minutos.
+async function steamRecent(id, lang) {
+  const ck = `r${id}${lang}`;
+  const hit = getCached(ck);
+  if (hit) return hit;
+  const d = await steam(id);
+  const picks = d.games.filter((g) => g.achEarned > 0).slice(0, 8);
+  const res = await Promise.all(picks.map((g) => steamAch(id, g.id.slice(1), lang)
+    .then((r) => r.list.filter((a) => a.achieved && a.time).slice(0, 3).map((a) => ({ ...a, gameId: g.id, game: g.name })))
+    .catch(() => [])));
+  const list = res.flat().sort((a, b) => b.time - a.time).slice(0, 8).map((a) => ({
+    id: a.id, name: a.name, description: a.description, icon: a.icon, time: a.time, gameId: a.gameId, game: a.game,
+  }));
+  const out = { list };
+  setCached(ck, out, 5 * 60000);
   return out;
 }
 
 // ---------- Xbox (OpenXBL, servicio de terceros) ----------
 // Respuestas segun la especificacion OpenAPI de OpenXBL: { content: {...}, code }.
+// Si no se define XBL_BASE, ademas de api.xbl.io se prueba la direccion anterior (xbl.io/api) cuando la principal
+// no responde o no encuentra la ruta. Un 401/403/429 se informa tal cual: la otra direccion daria lo mismo.
+const XBL_BASES = process.env.XBL_BASE ? [XBL] : [XBL, 'https://xbl.io/api'];
 async function xblGet(path, key) {
-  return unwrap(await getJson(`${XBL}/v2${path}`, { 'X-Authorization': key, Accept: 'application/json' }));
+  const headers = { 'X-Authorization': key, Accept: 'application/json' };
+  let last;
+  for (const b of XBL_BASES) {
+    try {
+      return unwrap(await getJson(`${b}/v2${path}`, headers));
+    } catch (e) {
+      last = e;
+      if (e.status === 401 || e.status === 403 || e.status === 429) throw e;
+    }
+  }
+  throw last;
 }
 
 // Consulta con memoria: ahorra solicitudes (el plan gratuito permite unas 150 por hora)
@@ -135,33 +202,39 @@ async function xblCached(path, key, ttl) {
 
 // OpenXBL no entrega minutos jugados: las horas de Xbox quedan como null ("—" en la app).
 async function xbox(key) {
-  const [t, acc, pres] = await Promise.all([
-    xblCached('/titles', key, 5 * 60000),
+  const [tr, acc, pres] = await Promise.all([
+    xblCached('/titles', key, 5 * 60000).then((v) => ({ v }), (e) => ({ e })),
     xblCached('/account', key, 6 * 3600000).catch(() => null),
     xblCached('/presence', key, 60000).catch(() => null),
   ]);
+  const t = tr.v;
   const all = (t && t.titles) || [];
   let list = all.filter((x) => !x.type || /game/i.test(x.type));
   if (!list.length) list = all;   // si el tipo viene distinto, no se descarta nada
-  let games = list.map((x) => {
+  // /titles y /achievements traen los juegos con la misma forma: x.achievement = { currentAchievements, totalAchievements, progressPercentage }.
+  const mapTitle = (x) => {
     const a = x.achievement || {};
-    const cur = a.currentAchievements || 0;
+    let cur = a.currentAchievements || 0;
     let tot = a.totalAchievements || 0;
+    if (Array.isArray(x.achievements)) {   // forma alternativa: lista completa de logros
+      cur = x.achievements.filter((v) => v.isUnlocked).length;
+      tot = x.achievements.length;
+    }
     // Xbox a veces informa total 0: se estima con el porcentaje de progreso.
     if (tot < cur) tot = a.progressPercentage > 0 ? Math.round((cur * 100) / a.progressPercentage) : cur;
     return { id: 'x' + x.titleId, name: x.name, platform: 'xbox', hours: null, achEarned: cur, achTotal: tot, cover: x.displayImage };
-  });
-  // Respaldo: si el historial de titulos llega vacio, se arma la lista con los logros.
+  };
+  let games = list.map(mapTitle);
+  // Respaldo: si el historial de titulos llega vacio o falla, se arma la lista con los logros.
+  let achErr = null;
   if (!games.length) {
     try {
       const ach = await xblCached('/achievements', key, 5 * 60000);
-      games = ((ach && ach.titles) || []).map((x) => {
-        const l = x.achievements || [];
-        const cur = l.filter((v) => v.isUnlocked).length;
-        return { id: 'x' + x.titleId, name: x.name, platform: 'xbox', hours: null, achEarned: cur, achTotal: Math.max(l.length, cur), cover: x.displayImage };
-      });
-    } catch (e) { /* sin respaldo */ }
+      games = ((ach && ach.titles) || []).map(mapTitle);
+    } catch (e) { achErr = e; }
   }
+  // Si ninguna de las dos consultas funciono, se informa la causa real (clave rechazada, limite, etc.).
+  if (!games.length && (tr.e || achErr)) throw tr.e || achErr;
   let avatar = null;
   try {
     const s2 = acc.profileUsers[0].settings.find((v) => v.id === 'GameDisplayPicRaw');
@@ -181,7 +254,7 @@ async function xbox(key) {
 // Diagnostico: informa que responde OpenXBL, sin devolver datos personales.
 async function xboxDebug(key) {
   const probe = async (path) => {
-    try { return { ok: true, c: await xblGet(path, key) }; } catch (e) { return { ok: false, status: e.status || null, msg: e.message }; }
+    try { return { ok: true, c: await xblGet(path, key) }; } catch (e) { return { ok: false, status: e.status || null, msg: e.message, detail: e.detail || null }; }
   };
   const [t, a, acc, pres] = await Promise.all([probe('/titles'), probe('/achievements'), probe('/account'), probe('/presence')]);
   const titles = (t.ok && t.c && t.c.titles) || [];
@@ -263,6 +336,10 @@ http.createServer(async (req, res) => {
     // Datos.
     m = /^\/api\/game\/steam\/(\d{1,10})$/.exec(u.pathname);
     if (m) return send(res, 200, await steamGame(m[1], u.searchParams.get('lang') === 'en' ? 'english' : 'spanish'));
+    m = /^\/api\/achievements\/steam\/(\d{17})\/(\d{1,10})$/.exec(u.pathname);
+    if (m) return send(res, 200, await steamAch(m[1], m[2], u.searchParams.get('lang') === 'en' ? 'english' : 'spanish'));
+    m = /^\/api\/recent\/steam\/(\d{17})$/.exec(u.pathname);
+    if (m) return send(res, 200, await steamRecent(m[1], u.searchParams.get('lang') === 'en' ? 'english' : 'spanish'));
     m = /^\/api\/steam\/(\d{17})$/.exec(u.pathname);
     if (m) return send(res, 200, await steam(m[1]));
     if (u.pathname === '/api/xbox/debug') {
@@ -277,6 +354,7 @@ http.createServer(async (req, res) => {
     }
     return send(res, 404, { error: 'no encontrado' });
   } catch (e) {
-    return send(res, e.status === 404 || e.status === 401 ? e.status : 502, { error: e.message });
+    const st = e.status === 403 ? 401 : e.status;
+    return send(res, st === 404 || st === 401 || st === 429 ? st : 502, { error: e.message, upstream: e.status || null });
   }
 }).listen(PORT, () => console.log('Servidor de Oasis en el puerto ' + PORT));
