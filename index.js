@@ -16,6 +16,7 @@ const PORT = process.env.PORT || 3000;
 const KEY = process.env.STEAM_API_KEY;
 const BASE = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const STEAM = process.env.STEAM_API_BASE || 'https://api.steampowered.com';
+const STORE = process.env.STEAM_STORE_BASE || 'https://store.steampowered.com';
 const XBL = (process.env.XBL_BASE || 'https://api.xbl.io').replace(/\/$/, '');
 const XBL_PUBLIC = process.env.XBL_PUBLIC_KEY || process.env.XBL_APP_KEY;
 const XBL_SECRET = process.env.XBL_APP_KEY || process.env.XBL_PUBLIC_KEY;
@@ -83,6 +84,28 @@ async function steam(id) {
   }));
   const out = { games, now: pl.gameextrainfo ? { name: pl.gameextrainfo, platform: 'steam' } : null, avatar: pl.avatarfull };
   setCached('s' + id, out);
+  return out;
+}
+
+// Detalles de un juego de Steam (sinopsis, generos, desarrollador, fecha) desde la tienda publica de Steam.
+// Esa interfaz no esta documentada oficialmente y podria cambiar. Se guarda un dia para consultar poco.
+const clean = (t) => String(t || '').replace(/<[^>]*>/g, '').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').trim();
+async function steamGame(id, lang) {
+  const ck = `g${id}${lang}`;
+  const hit = getCached(ck);
+  if (hit) return hit;
+  const j = await getJson(`${STORE}/api/appdetails?appids=${id}&l=${lang}`);
+  const d = j && j[id] && j[id].success ? j[id].data : null;
+  const out = d
+    ? {
+        description: clean(d.short_description) || null,
+        genres: (d.genres || []).map((g) => g.description),
+        developers: d.developers || [],
+        release: (d.release_date && !d.release_date.coming_soon && d.release_date.date) || null,
+        metacritic: (d.metacritic && d.metacritic.score) || null,
+      }
+    : { description: null, genres: [], developers: [], release: null, metacritic: null };
+  setCached(ck, out, 24 * 3600000);
   return out;
 }
 
@@ -238,6 +261,8 @@ http.createServer(async (req, res) => {
     }
 
     // Datos.
+    m = /^\/api\/game\/steam\/(\d{1,10})$/.exec(u.pathname);
+    if (m) return send(res, 200, await steamGame(m[1], u.searchParams.get('lang') === 'en' ? 'english' : 'spanish'));
     m = /^\/api\/steam\/(\d{17})$/.exec(u.pathname);
     if (m) return send(res, 200, await steam(m[1]));
     if (u.pathname === '/api/xbox/debug') {
