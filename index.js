@@ -158,6 +158,26 @@ async function steamAch(id, appid, lang) {
   return out;
 }
 
+// Registro completo de logros obtenidos (para la pantalla Notificaciones): todos los logros conseguidos de los juegos
+// con logros que ya conoce el servidor (los de mayor tiempo de juego), del mas reciente al mas antiguo. Se guarda 5 minutos.
+// Un logro con unlocktime 0 (Steam no informa la fecha) se entrega con time 0.
+async function steamUnlocked(id, lang) {
+  const ck = `u${id}${lang}`;
+  const hit = getCached(ck);
+  if (hit) return hit;
+  const d = await steam(id);
+  const picks = d.games.filter((g) => g.achEarned > 0);
+  const res = await Promise.all(picks.map((g) => steamAch(id, g.id.slice(1), lang)
+    .then((r) => r.list.filter((a) => a.achieved).map((a) => ({
+      id: a.id, name: a.name, description: safe(String(a.description || '').replace(/<[^>]*>/g, ''), 140), icon: a.icon, time: a.time || 0, gameId: g.id, game: g.name,
+    })))
+    .catch(() => [])));
+  const list = res.flat().sort((a, b) => b.time - a.time).slice(0, 600);
+  const out = { list, games: picks.length };
+  setCached(ck, out, 5 * 60000);
+  return out;
+}
+
 // Logros obtenidos mas recientemente entre los juegos con logros (hasta 8). Se guarda 5 minutos.
 async function steamRecent(id, lang) {
   const ck = `r${id}${lang}`;
@@ -488,6 +508,8 @@ http.createServer(async (req, res) => {
     if (m) return send(res, 200, await steamGame(m[1], u.searchParams.get('lang') === 'en' ? 'english' : 'spanish'));
     m = /^\/api\/achievements\/steam\/(\d{17})\/(\d{1,10})$/.exec(u.pathname);
     if (m) return send(res, 200, await steamAch(m[1], m[2], u.searchParams.get('lang') === 'en' ? 'english' : 'spanish'));
+    m = /^\/api\/unlocked\/steam\/(\d{17})$/.exec(u.pathname);
+    if (m) return send(res, 200, await steamUnlocked(m[1], u.searchParams.get('lang') === 'en' ? 'english' : 'spanish'));
     m = /^\/api\/recent\/steam\/(\d{17})$/.exec(u.pathname);
     if (m) return send(res, 200, await steamRecent(m[1], u.searchParams.get('lang') === 'en' ? 'english' : 'spanish'));
     m = /^\/api\/steam\/(\d{17})$/.exec(u.pathname);
